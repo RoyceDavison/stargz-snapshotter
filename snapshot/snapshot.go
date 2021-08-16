@@ -22,6 +22,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -36,6 +37,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -54,6 +56,7 @@ const (
 	remoteSnapshotLogKey = "remote-snapshot-prepared"
 	prepareSucceeded     = "true"
 	prepareFailed        = "false"
+	fuseSuperMagic       = 0x65735546
 )
 
 // FileSystem is a backing filesystem abstraction.
@@ -226,6 +229,14 @@ func (o *snapshotter) Usage(ctx context.Context, key string) (snapshots.Usage, e
 	return usage, nil
 }
 
+func isFUSE(dir string) bool {
+	var st unix.Statfs_t
+	if err := unix.Statfs(dir, &st); err != nil {
+		return false
+	}
+	return st.Type == fuseSuperMagic
+}
+
 func (o *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
 	s, err := o.createSnapshot(ctx, snapshots.KindActive, key, parent, opts)
 	if err != nil {
@@ -245,6 +256,7 @@ func (o *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...s
 		//       must log whether this method succeeded to prepare that remote snapshot
 		//       or not, using the key `remoteSnapshotLogKey` defined in the above. This
 		//       log is used by tests in this project.
+
 		lCtx := log.WithLogger(ctx, log.G(ctx).WithField("key", key).WithField("parent", parent))
 		if err := o.prepareRemoteSnapshot(lCtx, key, base.Labels); err != nil {
 			log.G(lCtx).WithField(remoteSnapshotLogKey, prepareFailed).
@@ -254,17 +266,21 @@ func (o *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...s
 			err := o.Commit(ctx, target, key, append(opts, snapshots.WithLabels(base.Labels))...)
 			if err == nil || errdefs.IsAlreadyExists(err) {
 				// count also AlreadyExists as "success"
-				log.G(lCtx).WithField(remoteSnapshotLogKey, prepareSucceeded).Debug("prepared remote snapshot")
+				log.G(lCtx).WithField(remoteSnapshotLogKey, prepareSucceeded).Debug("Prepare(): prepared remote snapshot")
 				return nil, errors.Wrapf(errdefs.ErrAlreadyExists, "target snapshot %q", target)
 			}
 			log.G(lCtx).WithField(remoteSnapshotLogKey, prepareFailed).
-				WithError(err).Warn("failed to internally commit remote snapshot")
+				WithError(err).Warn("Prepare(): failed to internally commit remote snapshot")
 			// Don't fallback here (= prohibit to use this key again) because the FileSystem
 			// possible has done some work on this "upper" directory.
 			return nil, err
 		}
 	}
-	return o.mounts(ctx, s, parent)
+	allMounts, err := o.mounts(ctx, s, parent)
+	for _, m := range allMounts {
+		log.G(ctx).Debugf("Prepare(): mount.Mount.Type=%s", m.Type)
+	}
+	return allMounts, err
 }
 
 func (o *snapshotter) View(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
@@ -653,7 +669,7 @@ func (o *snapshotter) prepareRemoteSnapshot(ctx context.Context, key string, lab
 	}
 
 	mountpoint := o.upperPath(id)
-	log.G(ctx).Infof("preparing filesystem mount at mountpoint=%v", mountpoint)
+	log.G(ctx).Infof("prepareRemoteSnapshot(): preparing filesystem mount at mountpoint=%v", mountpoint)
 
 	return o.fs.Mount(ctx, mountpoint, labels)
 }
@@ -662,7 +678,6 @@ func (o *snapshotter) prepareRemoteSnapshot(ctx context.Context, key string, lab
 // layers using filesystem's checking functionality.
 func (o *snapshotter) checkAvailability(ctx context.Context, key string) bool {
 	ctx = log.WithLogger(ctx, log.G(ctx).WithField("key", key))
-	log.G(ctx).Debug("checking layer availability")
 
 	ctx, t, err := o.ms.TransactionContext(ctx, false)
 	if err != nil {
@@ -680,17 +695,20 @@ func (o *snapshotter) checkAvailability(ctx context.Context, key string) bool {
 		}
 		mp := o.upperPath(id)
 		lCtx := log.WithLogger(ctx, log.G(ctx).WithField("mount-point", mp))
+		log.G(ctx).Debugf("checkAvailability(): %s isFUSE? - %s", mp, strconv.FormatBool(isFUSE(mp)))
+
 		if _, ok := info.Labels[remoteLabel]; ok {
 			eg.Go(func() error {
-				log.G(lCtx).Debug("checking mount point")
+				log.G(lCtx).Debug("checkAvailability(): checking mount point")
+
 				if err := o.fs.Check(egCtx, mp, info.Labels); err != nil {
-					log.G(lCtx).WithError(err).Warn("layer is unavailable")
+					log.G(lCtx).WithError(err).Warn("checkAvailability(): layer is unavailable")
 					return err
 				}
 				return nil
 			})
 		} else {
-			log.G(lCtx).Debug("layer is normal snapshot(overlayfs)")
+			log.G(lCtx).Debug("checkAvailability(): layer is normal snapshot(overlayfs)")
 		}
 		cKey = info.Parent
 	}
